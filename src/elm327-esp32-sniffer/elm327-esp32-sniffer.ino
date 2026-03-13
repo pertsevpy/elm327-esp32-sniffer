@@ -6,11 +6,13 @@
  * - Сниффер трафика с отображением в браузере по WiFi
  * - Управление скоростью UART через веб-интерфейс
  * - Корректная обработка длинных ответов (буферизация до промпта '>')
+ * - Опциональная поддержка датчика DS18B20 (температура салона)
  * 
  * Подключение:
  *   ELM327 TX  -> GPIO4 (RX1)
  *   ELM327 RX  -> GPIO5 (TX1)
  *   GND -> GND
+ *   (для DS18B20: DATA -> GPIO18, VCC -> 3.3V, GND -> GND, подтяжка 4.7к)
  * 
  * USB подключение к маршрутному компьютеру (ПК, планшет)
  * 
@@ -33,6 +35,19 @@ const char* ap_password = "12345678";
 #define ELM_TX_PIN 5
 
 // USB Serial (CDC) для связи с ПК - используется стандартный объект Serial
+
+// Опция: включить поддержку DS18B20 (раскомментировать для использования)
+//#define USE_DS18B20
+#ifdef USE_DS18B20
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#define ONE_WIRE_BUS 18
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+float lastTemperature = 0;
+unsigned long lastTempRead = 0;
+const long tempInterval = 2000; // читаем каждые 2 секунды
+#endif
 
 // ================================================
 
@@ -353,5 +368,22 @@ void loop() {
   if (linePos > 0 && (millis() - lastCharTime > LINE_TIMEOUT)) {
     flushLine("ELM->USB (timeout)");
   }
+
+#ifdef USE_DS18B20
+  // Чтение DS18B20
+  if (millis() - lastTempRead >= tempInterval) {
+    sensors.requestTemperatures();
+    float temp = sensors.getTempCByIndex(0);
+    if (temp != DEVICE_DISCONNECTED_C && temp != lastTemperature) {
+      lastTemperature = temp;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "[SENSOR] Cabin Temperature: %.1f°C\n", temp);
+      broadcastData(msg, strlen(msg));
+      addToLog(msg, strlen(msg));
+    }
+    lastTempRead = millis();
+  }
+#endif
+
   delay(1);
 }
