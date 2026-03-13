@@ -2,11 +2,19 @@
  * ELM327 UART Sniffer / USB-UART Bridge for ESP32-C6
  * 
  * Функции:
+ * - v0.1
  * - Замена FT232: USB (CDC) <-> UART (ELM327)
  * - Сниффер трафика с отображением в браузере по WiFi
  * - Управление скоростью UART через веб-интерфейс
+ * - Отправка произвольных команд (текстовых или HEX) через веб-интерфейс
  * - Корректная обработка длинных ответов (буферизация до промпта '>')
  * - Опциональная поддержка датчика DS18B20 (температура салона)
+ * - v0.2
+ * - Увеличен буфер строки до 1024
+ * - Добавлена диагностика ошибок UART
+ * - Опция нормализации \n → \r
+ * - Убран delay(1) в loop
+ * - Добавлена отправка команд через WebSocket (cmd: и hex:)
  * 
  * Подключение:
  *   ELM327 TX  -> GPIO4 (RX1)
@@ -35,6 +43,11 @@ const char* ap_password = "12345678";
 #define ELM_TX_PIN 5
 
 // USB Serial (CDC) для связи с ПК - используется стандартный объект Serial
+// Примечание: на ESP32-C6 с USB CDC скорость, заданная в begin(), игнорируется,
+// хост сам устанавливает скорость. Оставляем для совместимости.
+
+// Опция нормализации перевода строки (замена \n на \r перед отправкой в ELM327)
+#define NORMALIZE_LF_TO_CR true   // true = заменять \n на \r
 
 // Опция: включить поддержку DS18B20 (раскомментировать для использования)
 //#define USE_DS18B20
@@ -61,11 +74,15 @@ volatile int logHead = 0;
 volatile int logTail = 0;
 
 // Буферизация входящих строк от ELM327
-#define MAX_LINE 512
+#define MAX_LINE 1024          // увеличенный размер буфера
 uint8_t lineBuffer[MAX_LINE];
 size_t linePos = 0;
 unsigned long lastCharTime = 0;
 const unsigned long LINE_TIMEOUT = 50; // 50 мс паузы = конец ответа
+
+// Для диагностики ошибок UART
+unsigned long lastUartErrorCheck = 0;
+const unsigned long UART_ERROR_INTERVAL = 1000; // проверка раз в секунду
 
 // ========== Функции работы с логом ==========
 void addToLog(const char* data, size_t len) {
@@ -153,6 +170,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       
     case WStype_TEXT: {
       String cmd = String((char*)payload);
+      
+      // Команда смены скорости
       if (cmd.startsWith("baud ")) {
         int newBaud = cmd.substring(5).toInt();
         if (newBaud == 9600 || newBaud == 19200 || newBaud == 38400 || newBaud == 115200 || newBaud == 230400) {
@@ -164,7 +183,105 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           webSocket.sendTXT(num, "ERROR: Unsupported baud rate");
         }
       }
-      // Можно добавить другие команды
+      // Текстовая команда (добавляется \r)
+      else if (cmd.startsWith("cmd:")) {
+        String textCmd = cmd.substring(4);
+        // Добавляем \r, если его нет
+        if (!textCmd.endsWith("\r")) {
+          textCmd += "\r";
+        }
+        // Сбрасываем буфер перед отправкой новой команды
+        flushLine("WEB->ELM (partial)");
+        
+        // Отправляем в ELM327
+        Serial1.print(textCmd);
+        
+        // Логируем отправленную команду
+        char output[256];
+        int pos = snprintf(output, sizeof(output), "[WEB->ELM] ");
+        for (size_t i = 0; i < textCmd.length(); i++) {
+          pos += snprintf(output + pos, sizeof(output) - pos, "%02X ", (uint8_t)textCmd[i]);
+        }
+        pos += snprintf(output + pos, sizeof(output) - pos, "| ");
+        for (size_t i = 0; i < textCmd.length(); i++) {
+          uint8_t c = textCmd[i];
+          if (c == '\r') {
+            output[pos++] = '\\';
+            output[pos++] = 'r';
+          } else if (c == '\n') {
+            output[pos++] = '\\';
+            output[pos++] = 'n';
+          } else if (c >= 32 && c <= 126) {
+            output[pos++] = (char)c;
+          } else {
+            output[pos++] = '.';
+          }
+        }
+        output[pos++] = '\n';
+        output[pos] = '\0';
+        
+        broadcastData(output, pos);
+        addToLog(output, pos);
+        
+        webSocket.sendTXT(num, "OK: Command sent");
+      }
+      // HEX-команда (байты, разделённые пробелами)
+      else if (cmd.startsWith("hex:")) {
+        String hexStr = cmd.substring(4);
+        int count = 0;
+        int start = 0;
+        int end;
+        uint8_t buf[128];
+        
+        while ((end = hexStr.indexOf(' ', start)) != -1) {
+          String byteStr = hexStr.substring(start, end);
+          if (byteStr.length() == 2) {
+            buf[count++] = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
+          }
+          start = end + 1;
+        }
+        // Последний байт (или единственный)
+        String lastByte = hexStr.substring(start);
+        if (lastByte.length() == 2) {
+          buf[count++] = (uint8_t)strtol(lastByte.c_str(), NULL, 16);
+        }
+        
+        if (count > 0) {
+          flushLine("WEB->ELM (partial)");
+          Serial1.write(buf, count);
+          
+          // Логирование
+          char output[256];
+          int pos = snprintf(output, sizeof(output), "[WEB->ELM] ");
+          for (int i = 0; i < count; i++) {
+            pos += snprintf(output + pos, sizeof(output) - pos, "%02X ", buf[i]);
+          }
+          pos += snprintf(output + pos, sizeof(output) - pos, "| ");
+          for (int i = 0; i < count; i++) {
+            uint8_t c = buf[i];
+            if (c == '\r') {
+              output[pos++] = '\\';
+              output[pos++] = 'r';
+            } else if (c == '\n') {
+              output[pos++] = '\\';
+              output[pos++] = 'n';
+            } else if (c >= 32 && c <= 126) {
+              output[pos++] = (char)c;
+            } else {
+              output[pos++] = '.';
+            }
+          }
+          output[pos++] = '\n';
+          output[pos] = '\0';
+          
+          broadcastData(output, pos);
+          addToLog(output, pos);
+          
+          webSocket.sendTXT(num, "OK: Hex command sent");
+        } else {
+          webSocket.sendTXT(num, "ERROR: No valid hex bytes");
+        }
+      }
       break;
     }
   }
@@ -181,8 +298,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         body { font-family: Arial; margin: 20px; background: #f0f0f0; }
         h1 { color: #333; }
         #log { background: black; color: #0f0; padding: 10px; height: 400px; overflow-y: scroll; font-family: monospace; white-space: pre-wrap; font-size: 12px; border-radius: 5px; }
-        .controls { margin: 10px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+        .controls, .command { margin: 10px 0; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
         .controls select, .controls button { padding: 8px; font-size: 14px; }
+        .command input[type="text"] { flex-grow: 1; padding: 8px; font-family: monospace; }
         .status { margin: 10px 0; padding: 8px; background: #ddd; border-radius: 5px; }
         .footer { margin-top: 20px; font-size: 12px; color: #777; }
     </style>
@@ -208,6 +326,13 @@ const char index_html[] PROGMEM = R"rawliteral(
             <option value="ascii">ASCII only</option>
         </select>
     </div>
+    <div class="command">
+        <input type="text" id="cmdInput" placeholder="Enter command (e.g. ATZ)">
+        <button onclick="sendCommand()">Send</button>
+        <label>
+            <input type="checkbox" id="hexMode"> Hex mode
+        </label>
+    </div>
     <div id="log"></div>
     <div class="footer">ESP32-C6 ELM327 Sniffer</div>
 
@@ -215,7 +340,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         var ws = new WebSocket('ws://' + window.location.hostname + ':81/');
         var logDiv = document.getElementById('log');
         var connSpan = document.getElementById('connStatus');
-        var currentFormat = 'ascii+hex';
 
         ws.onopen = function() {
             connSpan.innerHTML = 'WebSocket: <span style="color:green">Connected</span>';
@@ -248,6 +372,32 @@ const char index_html[] PROGMEM = R"rawliteral(
             var format = document.getElementById('format').value;
             ws.send('format ' + format);
         }
+
+        function sendCommand() {
+            var cmd = document.getElementById('cmdInput').value.trim();
+            if (cmd === '') return;
+            var hexMode = document.getElementById('hexMode').checked;
+            
+            if (hexMode) {
+                var bytes = cmd.split(/\s+/);
+                var valid = true;
+                for (var i = 0; i < bytes.length; i++) {
+                    if (!/^[0-9A-Fa-f]{2}$/.test(bytes[i])) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    alert('Invalid hex format. Use bytes like "22 00 01 0D"');
+                    return;
+                }
+                ws.send('hex:' + cmd);
+            } else {
+                ws.send('cmd:' + cmd);
+            }
+            
+            document.getElementById('cmdInput').value = '';
+        }
     </script>
 </body>
 </html>
@@ -257,10 +407,32 @@ void handleRoot() {
   server.send_P(200, "text/html", index_html);
 }
 
+// Проверка и логирование ошибок UART
+void checkUartErrors() {
+  // Проверяем ошибки записи
+  if (Serial1.getWriteError()) {
+    const char* err = "[UART] Write error detected\n";
+    broadcastData(err, strlen(err));
+    addToLog(err, strlen(err));
+    Serial1.clearWriteError();
+  }
+
+  // Проверяем переполнение буфера передачи (если свободно меньше 16 байт)
+  if (Serial1.availableForWrite() < 16) {
+    static unsigned long lastWarn = 0;
+    if (millis() - lastWarn > 5000) { // предупреждаем не чаще 1 раза в 5 секунд
+      const char* err = "[UART] TX buffer low (possible congestion)\n";
+      broadcastData(err, strlen(err));
+      addToLog(err, strlen(err));
+      lastWarn = millis();
+    }
+  }
+}
+
 // ========== SETUP ==========
 void setup() {
   // Инициализация USB CDC (для связи с ПК)
-  Serial.begin(115200);
+  Serial.begin();
   Serial.setDebugOutput(true);
   delay(1000);
   Serial.println("\n=== ELM327 Sniffer Bridge starting ===");
@@ -306,6 +478,13 @@ void loop() {
     size_t len = Serial.available();
     uint8_t buf[128];
     len = Serial.readBytes(buf, min(len, sizeof(buf)));
+    
+    // Опциональная нормализация \n → \r
+    if (NORMALIZE_LF_TO_CR) {
+      for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n') buf[i] = '\r';
+      }
+    }
     
     // Отправляем в ELM327
     Serial1.write(buf, len);
@@ -369,6 +548,12 @@ void loop() {
     flushLine("ELM->USB (timeout)");
   }
 
+  // Периодическая проверка ошибок UART
+  if (millis() - lastUartErrorCheck > UART_ERROR_INTERVAL) {
+    checkUartErrors();
+    lastUartErrorCheck = millis();
+  }
+
 #ifdef USE_DS18B20
   // Чтение DS18B20
   if (millis() - lastTempRead >= tempInterval) {
@@ -385,5 +570,5 @@ void loop() {
   }
 #endif
 
-  delay(1);
+  // delay(1) убрать для максимальной производительности
 }
