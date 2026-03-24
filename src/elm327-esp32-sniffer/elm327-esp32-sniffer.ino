@@ -15,6 +15,8 @@
  * - Опция нормализации \n → \r
  * - Убран delay(1) в loop
  * - Добавлена отправка команд через WebSocket (cmd: и hex:)
+ * - v0.21
+ * - Добавлен отображение uptime esp32 в веб-интерфейсе
  * 
  * Подключение:
  *   ELM327 TX  -> GPIO4 (RX1)
@@ -183,6 +185,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           webSocket.sendTXT(num, "ERROR: Unsupported baud rate");
         }
       }
+      // Запрос uptime
+      else if (cmd == "uptime") {
+        unsigned long uptimeSec = millis() / 1000;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "UPTIME:%lu", uptimeSec);
+        webSocket.sendTXT(num, buf);
+      }
       // Текстовая команда (добавляется \r)
       else if (cmd.startsWith("cmd:")) {
         String textCmd = cmd.substring(4);
@@ -301,7 +310,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .controls, .command { margin: 10px 0; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
         .controls select, .controls button { padding: 8px; font-size: 14px; }
         .command input[type="text"] { flex-grow: 1; padding: 8px; font-family: monospace; }
-        .status { margin: 10px 0; padding: 8px; background: #ddd; border-radius: 5px; }
+        .status { margin: 10px 0; padding: 8px; background: #ddd; border-radius: 5px; display: flex; justify-content: space-between; }
         .footer { margin-top: 20px; font-size: 12px; color: #777; }
     </style>
 </head>
@@ -309,6 +318,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <h1>ELM327 UART Sniffer</h1>
     <div class="status">
         <span id="connStatus">WebSocket: </span>
+        <span id="uptimeDisplay">Uptime: --</span>
     </div>
     <div class="controls">
         <select id="baud">
@@ -340,18 +350,31 @@ const char index_html[] PROGMEM = R"rawliteral(
         var ws = new WebSocket('ws://' + window.location.hostname + ':81/');
         var logDiv = document.getElementById('log');
         var connSpan = document.getElementById('connStatus');
+        var uptimeSpan = document.getElementById('uptimeDisplay');
 
         ws.onopen = function() {
             connSpan.innerHTML = 'WebSocket: <span style="color:green">Connected</span>';
             addLogLine('[System] Connected to sniffer');
+            // Запускаем периодический запрос uptime
+            setInterval(function() {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send("uptime");
+                }
+            }, 2000);
         };
         ws.onclose = function() {
             connSpan.innerHTML = 'WebSocket: <span style="color:red">Disconnected</span>';
             addLogLine('[System] Disconnected');
         };
         ws.onmessage = function(event) {
-            logDiv.innerHTML += event.data;
-            logDiv.scrollTop = logDiv.scrollHeight;
+            var data = event.data;
+            if (data.startsWith("UPTIME:")) {
+                var seconds = data.split(":")[1];
+                uptimeSpan.innerHTML = "Uptime: " + seconds + " s";
+            } else {
+                logDiv.innerHTML += data;
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
         };
 
         function addLogLine(text) {
@@ -431,8 +454,8 @@ void checkUartErrors() {
 
 // ========== SETUP ==========
 void setup() {
-  // Инициализация USB CDC (для связи с ПК)
-  Serial.begin();
+  // Инициализация USB CDC (для связи с ПК). Скорость для CDC не важна, но указываем для совместимости.
+  Serial.begin(115200);
   Serial.setDebugOutput(true);
   delay(1000);
   Serial.println("\n=== ELM327 Sniffer Bridge starting ===");
