@@ -16,7 +16,9 @@
  * - Убран delay(1) в loop
  * - Добавлена отправка команд через WebSocket (cmd: и hex:)
  * - v0.21
- * - Добавлен отображение uptime esp32 в веб-интерфейсе
+ * - Добавлен отображение uptime (времени работы) в веб-интерфейсе
+ * - v0.22
+ * - Исправлено переключение форматов отображения (ASCII, HEX, ASCII+HEX) на стороне клиента
  * 
  * Подключение:
  *   ELM327 TX  -> GPIO4 (RX1)
@@ -232,7 +234,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         broadcastData(output, pos);
         addToLog(output, pos);
         
-        webSocket.sendTXT(num, "OK: Command sent");
+        webSocket.sendTXT(num, "OK: Command sent\n");
       }
       // HEX-команда (байты, разделённые пробелами)
       else if (cmd.startsWith("hex:")) {
@@ -330,7 +332,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         </select>
         <button onclick="changeBaud()">Set Baud</button>
         <button onclick="clearLog()">Clear Log</button>
-        <select id="format" onchange="changeFormat()">
+        <select id="format">
             <option value="ascii+hex">ASCII + HEX</option>
             <option value="hex">HEX only</option>
             <option value="ascii">ASCII only</option>
@@ -351,11 +353,37 @@ const char index_html[] PROGMEM = R"rawliteral(
         var logDiv = document.getElementById('log');
         var connSpan = document.getElementById('connStatus');
         var uptimeSpan = document.getElementById('uptimeDisplay');
+        var currentFormat = 'ascii+hex';
+
+        function formatLogLine(line, format) {
+            var separatorIndex = line.indexOf('|');
+            if (separatorIndex === -1) {
+                return line;
+            }
+            var prefix = line.substring(0, separatorIndex).trim();
+            var suffix = line.substring(separatorIndex + 1).trim();
+            // Извлекаем направление (часть в квадратных скобках)
+            var direction = '';
+            var bracketClose = prefix.indexOf(']');
+            if (bracketClose !== -1) {
+                direction = prefix.substring(0, bracketClose + 1);
+            } else {
+                direction = prefix;
+            }
+
+            switch (format) {
+                case 'hex':
+                    return prefix + '\n';
+                case 'ascii':
+                    return direction + ' ' + suffix + '\n';
+                default:
+                    return prefix + ' | ' + suffix + '\n';
+            }
+        }
 
         ws.onopen = function() {
             connSpan.innerHTML = 'WebSocket: <span style="color:green">Connected</span>';
             addLogLine('[System] Connected to sniffer');
-            // Запускаем периодический запрос uptime
             setInterval(function() {
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send("uptime");
@@ -372,7 +400,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                 var seconds = data.split(":")[1];
                 uptimeSpan.innerHTML = "Uptime: " + seconds + " s";
             } else {
-                logDiv.innerHTML += data;
+                var formatted = formatLogLine(data, currentFormat);
+                logDiv.innerHTML += formatted;
                 logDiv.scrollTop = logDiv.scrollHeight;
             }
         };
@@ -392,8 +421,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         function changeFormat() {
-            var format = document.getElementById('format').value;
-            ws.send('format ' + format);
+            currentFormat = document.getElementById('format').value;
         }
 
         function sendCommand() {
@@ -418,9 +446,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             } else {
                 ws.send('cmd:' + cmd);
             }
-            
             document.getElementById('cmdInput').value = '';
         }
+
+        document.getElementById('format').addEventListener('change', changeFormat);
+        currentFormat = document.getElementById('format').value;
     </script>
 </body>
 </html>
